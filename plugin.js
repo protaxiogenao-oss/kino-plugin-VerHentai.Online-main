@@ -1,9 +1,30 @@
 // VerHentai (ver-hentai.online) — Hentai sub español
-// apiVersion 6 + browser pages for embed resolution
+// v1.2.0: miniaturas, servidores reales (sin anuncios), reproducción en todas las filas
 
 const BASE = "https://www.ver-hentai.online";
 const UA =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
+
+// Dominios de anuncio / tracking / captcha — nunca usar como stream
+const AD_HOSTS =
+  /benchform\.org|biomanos\.org|exoclick|magsrv|pemsrv|popunder|doubleclick|googlesyndication|adservice|histats|clickadu|juicyads|trafficjunky|adsterra|propeller|tsyndicate|es\.xxxgames|vhentaicommunity\.jimdofree|comunidad\.hentaird|t\.me|tiktok\.com|instagram\.com|youtube\.com|facebook\.com/i;
+
+// Embeds que suelen pedir captcha o no dan stream usable en Kino
+const SKIP_EMBED =
+  /do7go\.com|dood\.(watch|stream|to|la|ws|so|pm|sh|work)|ds2play|ds2video|playmogo\.com/i;
+
+const PREFERRED = [
+  "Filemoon",
+  "Lulu",
+  "SaveFiles",
+  "Voe",
+  "Gupload",
+  "VidHide",
+  "Sendvid",
+  "UpFiles",
+  "UsersDrive",
+  "Firestream",
+];
 
 function log(...args) {
   try {
@@ -33,83 +54,141 @@ function cleanTitle(t) {
     .replace(/&amp;/g, "&")
     .replace(/&#039;/g, "'")
     .replace(/&quot;/g, '"')
+    .replace(/&#(\d+);/g, (_, n) => String.fromCharCode(parseInt(n, 10)))
     .trim()
     .slice(0, 200);
 }
 
+function isAdUrl(url) {
+  if (!url) return true;
+  try {
+    const h = new URL(url).hostname;
+    if (AD_HOSTS.test(h)) return true;
+  } catch {
+    return true;
+  }
+  return false;
+}
+
+function pickPoster(block) {
+  if (!block) return undefined;
+  // Prefer real covers from zx89 CDN
+  const patterns = [
+    /src="(https?:\/\/[^"]*zx89\.site\/hentai\/(?:portadas|miniportadas|covers)[^"]+)"/i,
+    /src="(https?:\/\/[^"]*zx89\.site\/[^"]+\.(?:jpg|jpeg|png|webp)[^"]*)"/i,
+    /src="(https?:\/\/[^"]*hentaisd\.tv\/[^"]+\.(?:jpg|jpeg|png|webp)[^"]*)"/i,
+    /src="(https?:\/\/[^"]+(?:portadas|miniportadas|covers|poster)[^"]+\.(?:jpg|jpeg|png|webp)[^"]*)"/i,
+    /src="(https?:\/\/s4\.zx89\.site\/[^"]+)"/i,
+  ];
+  for (const re of patterns) {
+    const m = block.match(re);
+    if (m && !isAdUrl(m[1])) return m[1].replace(/&amp;/g, "&");
+  }
+  return undefined;
+}
+
+function seriesFromEpisodePath(path) {
+  // /hentaionline/slug-3.html → { seriesSlug, epNum }
+  const m = String(path).match(/\/hentaionline\/([a-z0-9\-_.]+)-(\d+)\.html/i);
+  if (!m) return null;
+  return { seriesSlug: m[1], epNum: parseInt(m[2], 10) };
+}
+
+/**
+ * Parse series/episode cards from any listing page.
+ * Handles <article> (directorio) and a.episode-card (home "nuevos").
+ */
 function parseCards(html) {
   const items = [];
   const seen = new Set();
 
-  const cardRe =
-    /<a[^>]+href="(\/infohentai\/([a-z0-9\-_.]+)\.html)"[^>]*>([\s\S]{0,1200}?)<\/a>/gi;
-  let m;
-  while ((m = cardRe.exec(html))) {
-    const slug = m[2];
-    if (!slug || seen.has(slug)) continue;
-    const block = m[3];
-    const title =
-      (block.match(/alt="([^"]{2,120})"/i) ||
-        block.match(/<h[23][^>]*>\s*([^<]+)/i) ||
-        block.match(/title="([^"]{2,120})"/i) ||
-        [])[1] || slug.replace(/-/g, " ");
-    const poster =
-      (block.match(/src="(https?:\/\/[^"]*zx89[^"]+)"/i) ||
-        block.match(/src="(https?:\/\/[^"]+(?:covers|cover|poster)[^"]+)"/i) ||
-        [])[1];
+  // Strip scripts so we don't pick JSON carousel entries without real cards
+  const body = String(html).replace(/<script[\s\S]*?<\/script>/gi, " ");
+
+  function pushSeries(slug, title, poster) {
+    if (!slug || seen.has(slug)) return;
+    if (/^(page|login|register|search|dir)/i.test(slug)) return;
     seen.add(slug);
     items.push({
       id: slug,
       ref: "series:" + slug,
-      title: cleanTitle(title),
+      title: cleanTitle(title || slug.replace(/-/g, " ")),
       kind: "series",
-      poster,
+      poster: poster || undefined,
       adult: true,
       lang: "es",
+      genres: ["anime"],
     });
   }
 
-  const epCardRe =
-    /<a[^>]+href="(\/hentaionline\/([a-z0-9\-_.]+)-(\d+)\.html)"[^>]*>([\s\S]{0,1200}?)<\/a>/gi;
-  while ((m = epCardRe.exec(html))) {
-    const seriesSlug = m[2];
-    if (!seriesSlug || seen.has(seriesSlug)) continue;
-    const block = m[4];
+  // 1) <article>…</article> (directorio, más vistos, sin censura)
+  const articles = body.match(/<article[\s\S]*?<\/article>/gi) || [];
+  for (const art of articles) {
+    const hrefM = art.match(
+      /href="((?:https?:\/\/[^"]+)?\/infohentai\/([a-z0-9\-_.]+)\.html)"/i
+    );
+    if (!hrefM) continue;
+    const slug = hrefM[2];
     const title =
-      (block.match(/alt="([^"]{2,120})"/i) ||
-        block.match(/<h[23][^>]*>\s*([^<]+)/i) ||
-        block.match(/<h3[^>]*>\s*([^<]+)/i) ||
-        [])[1] || seriesSlug.replace(/-/g, " ");
-    const poster =
-      (block.match(/src="(https?:\/\/[^"]*zx89[^"]+)"/i) ||
-        block.match(/src="(https?:\/\/[^"]+(?:covers|cover|poster|slides)[^"]+)"/i) ||
-        [])[1];
-    seen.add(seriesSlug);
-    items.push({
-      id: seriesSlug,
-      ref: "series:" + seriesSlug,
-      title: cleanTitle(title),
-      kind: "series",
-      poster,
-      adult: true,
-      lang: "es",
-    });
+      (art.match(/alt="([^"]{2,160})"/i) ||
+        art.match(/<h[23][^>]*>\s*([^<]+)/i) ||
+        [])[1] || slug;
+    pushSeries(slug, title, pickPoster(art));
   }
 
+  // 2) episode-card blocks (home "nuevos")
+  const epCards =
+    body.match(/<a[^>]+class="[^"]*episode-card[^"]*"[\s\S]*?<\/a>/gi) || [];
+  for (const card of epCards) {
+    const hrefM = card.match(
+      /href="(?:https?:\/\/[^"]+)?\/hentaionline\/([a-z0-9\-_.]+)-(\d+)\.html"/i
+    );
+    if (!hrefM) continue;
+    const seriesSlug = hrefM[1];
+    const title =
+      (card.match(/alt="([^"]{2,160})"/i) ||
+        card.match(/<h[23][^>]*>\s*([^<]+)/i) ||
+        [])[1] || seriesSlug;
+    const clean = String(title).replace(/\s*[-–]\s*Episodio\s*\d+/i, "").trim();
+    pushSeries(seriesSlug, clean, pickPoster(card));
+  }
+
+  // 3) Fallback: any /infohentai/ link with nearby poster
+  if (items.length < 3) {
+    const re =
+      /href="(?:https?:\/\/[^"]+)?(\/infohentai\/([a-z0-9\-_.]+)\.html)"/gi;
+    let m;
+    while ((m = re.exec(body))) {
+      const slug = m[2];
+      if (seen.has(slug)) continue;
+      const start = Math.max(0, m.index - 200);
+      const end = Math.min(body.length, m.index + 1800);
+      const block = body.slice(start, end);
+      const poster = pickPoster(block);
+      if (!poster) continue;
+      const title =
+        (block.match(/alt="([^"]{2,160})"/i) ||
+          block.match(/<h[23][^>]*>\s*([^<]+)/i) ||
+          [])[1] || slug;
+      pushSeries(slug, title, poster);
+    }
+  }
+
+  // 4) Fallback episode links
   if (items.length < 5) {
-    const re2 = /href="\/infohentai\/([a-z0-9\-_.]+)\.html"/gi;
-    while ((m = re2.exec(html))) {
-      const slug = m[1];
-      if (!slug || seen.has(slug)) continue;
-      seen.add(slug);
-      items.push({
-        id: slug,
-        ref: "series:" + slug,
-        title: cleanTitle(slug.replace(/-/g, " ")),
-        kind: "series",
-        adult: true,
-        lang: "es",
-      });
+    const epRe =
+      /href="(?:https?:\/\/[^"]+)?(\/hentaionline\/([a-z0-9\-_.]+)-(\d+)\.html)"/gi;
+    let em;
+    while ((em = epRe.exec(body))) {
+      const seriesSlug = em[2];
+      if (seen.has(seriesSlug)) continue;
+      const start = Math.max(0, em.index - 150);
+      const end = Math.min(body.length, em.index + 1200);
+      const block = body.slice(start, end);
+      const title =
+        (block.match(/alt="([^"]{2,160})"/i) || [])[1] || seriesSlug;
+      const clean = String(title).replace(/\s*[-–]\s*Episodio\s*\d+/i, "").trim();
+      pushSeries(seriesSlug, clean, pickPoster(block));
     }
   }
 
@@ -119,10 +198,9 @@ function parseCards(html) {
 function parseEpisodeList(html, seriesSlug) {
   const episodes = [];
   const found = new Set();
+  const esc = seriesSlug.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
   const re = new RegExp(
-    "href=\"/hentaionline/" +
-      seriesSlug.replace(/[.*+?^${}()|[\\]\\]/g, "\\$&") +
-      "-(\\d+)\\.html\"",
+    "href=\"(?:https?:\\/\\/[^\"]+)?\\/hentaionline\\/" + esc + "-(\\d+)\\.html\"",
     "gi"
   );
   let m;
@@ -148,10 +226,12 @@ function serverLabel(url) {
   if (u.includes("firestream")) return "Firestream";
   if (u.includes("streamhls") || u.includes("savefiles")) return "SaveFiles";
   if (u.includes("luluvid") || u.includes("luluvido")) return "Lulu";
-  if (u.includes("dood") || u.includes("do7go")) return "Doodstream";
   if (u.includes("gupload")) return "Gupload";
   if (u.includes("vidhide")) return "VidHide";
   if (u.includes("sendvid")) return "Sendvid";
+  if (u.includes("upfiles")) return "UpFiles";
+  if (u.includes("usersdrive")) return "UsersDrive";
+  if (u.includes("dood") || u.includes("do7go") || u.includes("playmogo")) return "Doodstream";
   try {
     return new URL(url).hostname.replace(/^www\./, "").split(".")[0];
   } catch {
@@ -163,6 +243,7 @@ function toEmbedUrl(url) {
   return String(url)
     .replace(/\\\\/g, "")
     .replace(/\\\//g, "/")
+    .replace(/\\u002F/gi, "/")
     .replace(/\/(d|w|v)\//, "/e/")
     .replace(/\/f\//, "/e/");
 }
@@ -173,38 +254,49 @@ function extractServers(html) {
 
   function add(raw) {
     if (!raw) return;
-    let url = toEmbedUrl(String(raw).trim());
+    let url = toEmbedUrl(String(raw).trim().replace(/&amp;/g, "&"));
     if (!/^https?:\/\//i.test(url)) return;
+    if (isAdUrl(url)) return;
+    if (SKIP_EMBED.test(url)) return; // captcha / unreliable
+    // only known video hosts
+    if (
+      !/(voe\.sx|firestream\.to|streamhls\.to|luluvid|luluvido|filemoon|byseraguci|savefiles|gupload|vidhide|sendvid|upfiles\.com|usersdrive)/i.test(
+        url
+      )
+    ) {
+      return;
+    }
     const key = url.replace(/\/+$/, "").toLowerCase();
     if (seen.has(key)) return;
     seen.add(key);
     servers.push({ label: serverLabel(url), url });
   }
 
+  // Plain URLs
   const hostRe =
-    /(https?:\/\/(?:voe\.sx|firestream\.to|streamhls\.to|luluvid\.com|luluvido\.com|filemoon\.[a-z]+|dood\.[a-z.]+|do7go\.com|gupload\.site|savefiles\.com|byseraguci\.com|vidhidepro\.com|sendvid\.com)\/[^\s"'<>\\&]+)/gi;
+    /(https?:\/\/(?:voe\.sx|firestream\.to|streamhls\.to|luluvid\.com|luluvido\.com|filemoon\.[a-z]+|byseraguci\.com|savefiles\.com|gupload\.site|vidhidepro\.com|sendvid\.com|upfiles\.com|usersdrive\.com)\/[^\s"'<>\\&]+)/gi;
   let m;
-  while ((m = hostRe.exec(html))) add(m[1].replace(/&amp;/g, "&"));
+  while ((m = hostRe.exec(html))) add(m[1]);
 
+  // HTML-entity encoded JSON: embed_code&quot;:&quot;https:\/\/...
   const entRe = /embed_code&quot;:&quot;(https?:\\\/\\\/[^&]+)/gi;
   while ((m = entRe.exec(html))) {
     add(m[1].replace(/\\\//g, "/"));
   }
 
-  const preferred = [
-    "SaveFiles",
-    "Voe",
-    "Lulu",
-    "Filemoon",
-    "Firestream",
-    "Gupload",
-    "Doodstream",
-    "Sendvid",
-    "VidHide",
-  ];
+  // Escaped JSON in scripts
+  const escRe = /"embed_code"\s*:\s*"(https?:\\\/\\\/[^"]+)"/gi;
+  while ((m = escRe.exec(html))) {
+    add(m[1].replace(/\\\//g, "/"));
+  }
+
+  // iframe src
+  const iframeRe = /<iframe[^>]+src=["'](https?:\/\/[^"']+)["']/gi;
+  while ((m = iframeRe.exec(html))) add(m[1]);
+
   servers.sort((a, b) => {
-    const ai = preferred.indexOf(a.label);
-    const bi = preferred.indexOf(b.label);
+    const ai = PREFERRED.indexOf(a.label);
+    const bi = PREFERRED.indexOf(b.label);
     return (ai === -1 ? 50 : ai) - (bi === -1 ? 50 : bi);
   });
 
@@ -212,7 +304,7 @@ function extractServers(html) {
 }
 
 export async function search(query) {
-  const q = (query.q || "").trim();
+  const q = (query && query.q ? query.q : "").trim();
   if (!q) return [];
 
   const urls = [
@@ -242,7 +334,7 @@ export async function search(query) {
     }
   }
 
-  return items.map((it) => ({ ...it, adult: true })).slice(0, 50);
+  return items.slice(0, 50);
 }
 
 export async function home() {
@@ -267,21 +359,6 @@ export async function home() {
   await addRow("sincensura", "Sin censura", "/hentai-sin-censura.html", 30);
   await addRow("directorio", "Directorio", "/dir-hentai/", 48, "anime");
 
-  try {
-    const html2 = await fetchText(BASE + "/dir-hentai/?page=2");
-    const more = parseCards(html2).slice(0, 40);
-    if (more.length) {
-      rows.push({
-        id: "directorio2",
-        title: "Más del directorio",
-        items: more,
-        ref: "lista:directorio",
-      });
-    }
-  } catch (e) {
-    log("home directorio2", e.message);
-  }
-
   return rows;
 }
 
@@ -293,8 +370,8 @@ export async function browse(ref, cursor) {
     "lista:directorio": "/dir-hentai/",
   };
 
-  let path = map[ref] || "/dir-hentai/";
-  let page = cursor ? parseInt(cursor, 10) || 1 : 1;
+  const path = map[ref] || "/dir-hentai/";
+  const page = cursor ? parseInt(cursor, 10) || 1 : 1;
 
   let url = BASE + path;
   if (page > 1) {
@@ -304,12 +381,16 @@ export async function browse(ref, cursor) {
   const html = await fetchText(url);
   const items = parseCards(html).slice(0, 48);
 
-  let next = null;
-  if (html.includes("page=" + (page + 1)) || html.includes("?page=" + (page + 1))) {
+  let next = undefined;
+  if (
+    html.includes("page=" + (page + 1)) ||
+    html.includes("?page=" + (page + 1)) ||
+    items.length >= 20
+  ) {
     next = String(page + 1);
   }
 
-  return { items: items.map((it) => ({ ...it, adult: true })), next };
+  return next ? { items, next } : { items };
 }
 
 export async function episodes(ref) {
@@ -332,6 +413,7 @@ export async function episodes(ref) {
   }
 
   if (!html) {
+    // Try episode 1 page and discover series link
     try {
       const epHtml = await fetchText(BASE + "/hentaionline/" + seriesSlug + "-1.html");
       const link = epHtml.match(/href="(\/infohentai\/[a-z0-9\-_.]+\.html)"/i);
@@ -343,7 +425,7 @@ export async function episodes(ref) {
           return {
             series: {
               title: cleanTitle(seriesSlug.replace(/-/g, " ")),
-              genres: [],
+              genres: ["anime"],
             },
             episodes: eps,
           };
@@ -355,9 +437,24 @@ export async function episodes(ref) {
     }
   }
 
-  const episodes = parseEpisodeList(html, seriesSlug);
+  let episodes = parseEpisodeList(html, seriesSlug);
   if (!episodes.length) {
-    throw kino.error("not_found", "No se encontraron episodios");
+    // Some series pages only list episode numbers differently
+    const loose = html.match(
+      new RegExp(
+        "/hentaionline/" +
+          seriesSlug.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") +
+          "-(\\d+)\\.html",
+        "gi"
+      )
+    );
+    if (loose && loose.length) {
+      episodes = parseEpisodeList(html, seriesSlug);
+    }
+  }
+  if (!episodes.length) {
+    // At least offer ep 1
+    episodes = [{ season: 1, number: 1, ref: "ep:" + seriesSlug + ":1", title: "Episodio 1" }];
   }
 
   let title = seriesSlug.replace(/-/g, " ");
@@ -367,11 +464,11 @@ export async function episodes(ref) {
     html.match(/og:title" content="([^"]+)"/i);
   if (titleMatch) title = cleanTitle(titleMatch[1]);
 
-  let poster;
-  const posterMatch =
-    html.match(/src="(https?:\/\/[^"]+zx89[^"]+)"/i) ||
-    html.match(/og:image" content="([^"]+)"/i);
-  if (posterMatch) poster = posterMatch[1];
+  let poster = pickPoster(html);
+  if (!poster) {
+    const og = html.match(/og:image" content="([^"]+)"/i);
+    if (og && !isAdUrl(og[1])) poster = og[1];
+  }
 
   let overview;
   const sinMatch = html.match(
@@ -380,7 +477,7 @@ export async function episodes(ref) {
   if (sinMatch) overview = sinMatch[1].replace(/<[^>]+>/g, "").trim().slice(0, 500);
 
   return {
-    series: { title, poster, overview, genres: [] },
+    series: { title, poster, overview, genres: ["anime"] },
     episodes,
   };
 }
@@ -393,6 +490,7 @@ export async function resolve(ref) {
       const u = (c.url || "") + " " + (c.mime || "");
       if (!c.url || !/^https?:\/\//i.test(c.url)) return -1;
       if (/blob:|data:/i.test(c.url)) return -1;
+      if (isAdUrl(c.url)) return -1;
       if (/\/e\/[a-z0-9]+\/?$/i.test(c.url) && !/m3u8|mp4|mpd/i.test(u)) return -1;
       let s = 0;
       if (/m3u8|\.mpd|mpegurl|dash\+xml/i.test(u)) s += 100;
@@ -418,7 +516,6 @@ export async function resolve(ref) {
       embedOrigin = new URL(embedUrl).origin;
     } catch {}
 
-    // Prefer headers captured with the media request (Cookie, token…)
     const headers = Object.assign({}, media.headers || {});
     if (!headers["User-Agent"] && !headers["user-agent"]) headers["User-Agent"] = UA;
     if (!headers.Referer && !headers.referer) headers.Referer = embedUrl;
@@ -440,12 +537,15 @@ export async function resolve(ref) {
     const re = /(https?:\/\/[^"'\\\s<>]+(?:\.m3u8|\.mpd|\.mp4)[^"'\\\s<>]*)/gi;
     let m;
     while ((m = re.exec(html))) {
-      found.push(m[1].replace(/\\u002F/g, "/").replace(/\\\//g, "/"));
+      const u = m[1].replace(/\\u002F/g, "/").replace(/\\\//g, "/");
+      if (!isAdUrl(u)) found.push(u);
     }
     const srcRe =
       /["'](?:src|file|source|url)["']\s*:\s*["'](https?:\/\/[^"']+)["']/gi;
     while ((m = srcRe.exec(html))) {
-      if (/\.m3u8|\.mp4|\.mpd|\/hls\/|playlist/i.test(m[1])) found.push(m[1]);
+      if (/\.m3u8|\.mp4|\.mpd|\/hls\/|playlist/i.test(m[1]) && !isAdUrl(m[1])) {
+        found.push(m[1]);
+      }
     }
     return [...new Set(found)];
   }
@@ -457,29 +557,28 @@ export async function resolve(ref) {
       host = new URL(embedUrl).hostname;
     } catch {}
 
-    // do7go / dood often force captcha — skip capture
-    const captchaProne = /do7go|dood/i.test(host);
+    if (SKIP_EMBED.test(host) || isAdUrl(embedUrl)) {
+      log("skip ad/captcha host", host);
+      return null;
+    }
 
-    if (!captchaProne) {
-      try {
-        const timeoutMs =
-          label === "SaveFiles" || label === "Voe" ? 18000 : 12000;
-        const page = await kino.browser.capture(embedUrl, {
-          timeoutMs,
-          headers: { Referer: BASE + "/", "User-Agent": UA },
-          match:
-            "m3u8|\\.mpd|\\.mp4|master|playlist|/hls/|videoplayback|manifest|index\\.m3u|urlset",
-        });
-        const media = pickMedia(page);
-        if (media) {
-          log("capture ok", label || "", media.url.slice(0, 140));
-          return media;
-        }
-      } catch (e) {
-        const msg = e.message || String(e);
-        log("capture err", label || "", msg);
-        if (/confirm a human|captcha|blocked/i.test(msg)) return null;
+    try {
+      const timeoutMs = label === "SaveFiles" || label === "Voe" || label === "Filemoon" ? 18000 : 14000;
+      const page = await kino.browser.capture(embedUrl, {
+        timeoutMs,
+        headers: { Referer: BASE + "/", "User-Agent": UA },
+        match:
+          "m3u8|\\.mpd|\\.mp4|master|playlist|/hls/|videoplayback|manifest|index\\.m3u|urlset",
+      });
+      const media = pickMedia(page);
+      if (media) {
+        log("capture ok", label || "", media.url.slice(0, 140));
+        return media;
       }
+    } catch (e) {
+      const msg = e.message || String(e);
+      log("capture err", label || "", msg);
+      if (/confirm a human|captcha|blocked/i.test(msg)) return null;
     }
 
     if (kino.browser && typeof kino.browser.page === "function") {
@@ -511,7 +610,7 @@ export async function resolve(ref) {
         timeoutMs: 8000,
       });
       if (r.ok) {
-        const urls = urlsFromHtml(r.text());
+        const urls = urlsFromHtml(await r.text());
         if (urls.length) {
           const u = urls.find((x) => /m3u8/i.test(x)) || urls[0];
           log("fetch-extract ok", label || "", u.slice(0, 140));
@@ -528,8 +627,12 @@ export async function resolve(ref) {
     return null;
   }
 
-  if (ref.startsWith("embed:")) {
-    const embedUrl = decodeURIComponent(ref.slice(6));
+  // Lazy alternative: embed:URL
+  if (String(ref).startsWith("embed:")) {
+    const embedUrl = decodeURIComponent(String(ref).slice(6));
+    if (isAdUrl(embedUrl) || SKIP_EMBED.test(embedUrl)) {
+      throw kino.error("unavailable", "Servidor no disponible (anuncio o captcha)");
+    }
     try {
       const media = await captureEmbed(embedUrl, serverLabel(embedUrl));
       if (media) return streamFrom(media, embedUrl, serverLabel(embedUrl));
@@ -540,12 +643,12 @@ export async function resolve(ref) {
   }
 
   let seriesSlug, epNum;
-  if (ref.startsWith("ep:")) {
-    const parts = ref.slice(3).split(":");
+  if (String(ref).startsWith("ep:")) {
+    const parts = String(ref).slice(3).split(":");
     seriesSlug = parts[0];
     epNum = parseInt(parts[1], 10);
-  } else if (ref.startsWith("series:")) {
-    seriesSlug = ref.slice(7);
+  } else if (String(ref).startsWith("series:")) {
+    seriesSlug = String(ref).slice(7);
     epNum = 1;
   } else {
     throw kino.error("not_found", "Referencia inválida");
@@ -565,12 +668,14 @@ export async function resolve(ref) {
 
   const servers = extractServers(html);
   if (!servers.length) {
-    throw kino.error("unavailable", "No se encontraron servidores");
+    throw kino.error(
+      "unavailable",
+      "No hay servidores reproducibles (solo anuncios o captcha)"
+    );
   }
 
-  // Only top 3 for speed (SaveFiles / Voe / Lulu first)
   const tried = [];
-  const maxTry = Math.min(servers.length, 3);
+  const maxTry = Math.min(servers.length, 4);
   for (let i = 0; i < maxTry; i++) {
     const s = servers[i];
     tried.push(s.label);
